@@ -1,5 +1,6 @@
-%% ---------------- Functions ----------------
+addpath("utils");
 
+%% ---------------- Complementary Filter Logic ---------------
 function [roll_f, pitch_f, yaw_f, qf] = comp_step(roll_prev, pitch_prev, yaw_prev, gyr, acc, params)
   % Single complementary-filter update step performing:
   %  - integrate gyro to get angle prediction
@@ -34,33 +35,6 @@ function [roll_f, pitch_f, yaw_f, qf] = comp_step(roll_prev, pitch_prev, yaw_pre
   % 5) Convert to quaternion and normalize
   qf = eul2quat(roll_f, pitch_f, yaw_f);
   qf = normalize_quat(qf);
-endfunction
-
-function q = eul2quat(roll, pitch, yaw)
-  % Convert ZYX (yaw-pitch-roll) Euler to quaternion [w x y z]
-  cr = cos(roll/2); sr = sin(roll/2);
-  cp = cos(pitch/2); sp = sin(pitch/2);
-  cy = cos(yaw/2); sy = sin(yaw/2);
-
-  w = cr*cp*cy + sr*sp*sy;
-  x = sr*cp*cy - cr*sp*sy;
-  y = cr*sp*cy + sr*cp*sy;
-  z = cr*cp*sy - sr*sp*cy;
-  q = [w x y z];
-endfunction
-
-function qn = normalize_quat(q)
-  n = norm(q);
-  if n == 0
-    qn = [1 0 0 0];   % fallback unit quaternion
-  else
-    qn = q / n;
-  end
-endfunction
-
-function a = wrap_angle(a)
-  % Wrap angle into [-pi, pi]
-  a = mod(a + pi, 2*pi) - pi;
 endfunction
 
 %% ---------------- Configuration / Constants ----------------
