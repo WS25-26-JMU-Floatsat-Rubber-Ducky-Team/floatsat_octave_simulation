@@ -16,7 +16,7 @@ function params = setup_params()
   % Simulation params
   params.SAMPLE_RATE_HZ = 100;
   params.DT = 1.0 / params.SAMPLE_RATE_HZ;
-  params.SIM_DURATION_S = 4.0;
+  params.SIM_DURATION_S = 20.0;
   params.N = round(params.SIM_DURATION_S * params.SAMPLE_RATE_HZ);
 
   % Physical constants
@@ -34,9 +34,9 @@ function params = setup_params()
   params.INITIAL_YAW = 0.0;
 
   % PID tuning (per-axis)
-  params.PID.Kp = [4.0, 4.0, 4.0];
-  params.PID.Ki = [1.0, 1.0, 1.0];
-  params.PID.Kd = [0.1, 0.1, 0.1];
+  params.PID.Kp = [0.8, 0.8, 0.8];
+  params.PID.Ki = [0.05, 0.05, 0.05];
+  params.PID.Kd = [0.01, 0.01, 0.01];
   params.PID.tau_D = 0.02;
   params.PID.integrator_min_frac = -0.5;  % fraction of actuator max (scaled later)
   params.PID.integrator_max_frac =  0.5;
@@ -50,6 +50,11 @@ function params = setup_params()
   % Setpoint: change at 1 second
   params.SETPOINT_STEP_TIME = 1.0;
   params.SETPOINT_DEG = [10, -5, 20]; % [roll, pitch, yaw] in degrees after step
+
+  % Flywheel actuator parameters
+  params.FLYWHEEL.Jw = [0.01, 0.01, 0.01];    % kg·m^2, moment of inertia per axis
+  params.FLYWHEEL.angvel_max = deg2rad([500, 500, 500]); % rad/s max wheel speed
+  params.FLYWHEEL.torque_max = deg2rad([50, 50, 50]);    % rad/s^2 equivalent torque limit
 
   % Make params easier to pass to comp_step
   params.comp.DT = params.DT;
@@ -92,6 +97,10 @@ function state = setup_state(params)
   state.pid.prev_error = [0,0,0];
   state.pid.prev_derivative = [0,0,0];
 
+  % Wheel torque applied at each step
+  state.torque_wheel_actual = zeros(N,3);   % torque actually applied by wheel
+  state.torque_wheel_desired = zeros(N,3);  % PID-desired torque on body
+
   % Initial true state: level + initial yaw
   state.angle_true(1,:) = [0, 0, params.INITIAL_YAW];
   state.angvel_true(1,:) = [0,0,0];
@@ -121,15 +130,15 @@ function [state, params] = run_simulation(state, params)
   EPS = params.EPS;
 
   for k = 2:N
-    % 1) Sensors sample the true plant
+    % Sensors sample the true plant
     state.gyr_meas(k,:) = state.angvel_true(k-1,:);
     state.acc_meas(k,:) = true_accel_from_euler(state.angle_true(k-1,1), state.angle_true(k-1,2), state.angle_true(k-1,3), params.G);
 
-    % 2) Filter: fused estimate from sensors
+    % Filter: fused estimate from sensors
     [rf, pf, yf, qf] = comp_step(state.roll_f(k-1), state.pitch_f(k-1), state.yaw_f(k-1), state.gyr_meas(k,:), state.acc_meas(k,:), params.comp);
     state.roll_f(k) = rf; state.pitch_f(k) = pf; state.yaw_f(k) = yf; state.Qf(k,:) = qf;
 
-    % 3) Controller (PID) uses the FILTERED measurements
+    % Controller (PID) uses the FILTERED measurements
     sp = state.setpoint(k,:);
     meas = [rf, pf, yf];
     for axis = 1:3
@@ -157,20 +166,30 @@ function [state, params] = run_simulation(state, params)
       state.cmd_angvel(k, axis) = u;
     endfor
 
-    % 4) Actuator (currently simple angvel actuator; swap this for flywheel later)
     for axis = 1:3
-      u_sat = clamp(state.cmd_angvel(k,axis), params.ACTUATOR_MIN_ANGVEL, params.ACTUATOR_MAX_ANGVEL);
-      if params.ACTUATOR_TIMECONST <= EPS
-        state.angvel_act_state(axis) = u_sat;
-      else
-        alpha_act = DT / (params.ACTUATOR_TIMECONST + DT);
-        state.angvel_act_state(axis) = state.angvel_act_state(axis) + alpha_act * (u_sat - state.angvel_act_state(axis));
-      endif
-      state.cmd_after_act(k, axis) = state.angvel_act_state(axis);
-      state.angvel_true(k, axis) = state.angvel_act_state(axis);
+        % Desired angular velocity from PID
+        omega_desired = state.cmd_angvel(k, axis);
+
+        % Current body angular velocity
+        omega_current = state.angvel_true(k-1, axis);
+
+        % Compute desired acceleration to reach omega_desired
+        alpha_desired = (omega_desired - omega_current) / DT;
+
+        % Convert to torque
+        I_body = 1.0;   % body inertia
+        state.torque_wheel_desired(k, axis) = -I_body * alpha_desired; % desired torque before clamping
+        tau_body = clamp(I_body * alpha_desired, -params.FLYWHEEL.torque_max(axis), params.FLYWHEEL.torque_max(axis));
+        state.torque_wheel_actual(k, axis) = -tau_body;  % torque applied by wheel
+
+        % Update body angular velocity
+        state.angvel_true(k, axis) = omega_current + (tau_body / I_body) * DT;
+
+        % Update body angle
+        state.angle_true(k, axis) = wrap_angle(state.angle_true(k-1, axis) + state.angvel_true(k, axis) * DT);
     endfor
 
-    % 5) Plant integration (angles)
+    % Plant integration (angles)
     state.angle_true(k, :) = state.angle_true(k-1, :) + state.angvel_true(k, :) * DT;
     state.angle_true(k,1) = wrap_angle(state.angle_true(k,1));
     state.angle_true(k,2) = wrap_angle(state.angle_true(k,2));
@@ -213,30 +232,48 @@ function plot_results(state, params)
   % Angular velocity commands
   figure('Name','Angular velocity commands','NumberTitle','off');
   cmd_before_deg = deg(state.cmd_angvel);
-  cmd_after_deg = deg(state.cmd_after_act);
   angvel_true_deg = deg(state.angvel_true);
 
   subplot(3,1,1);
   plot(t, cmd_before_deg(:,IDX_X), '--', 'LineWidth', 1.0); hold on;
-  plot(t, cmd_after_deg(:,IDX_X), '-', 'LineWidth', 1.0);
-  plot(t, angvel_true_deg(:,IDX_X), ':', 'LineWidth', 1.0);
+  plot(t, angvel_true_deg(:,IDX_X), '-', 'LineWidth', 1.0);
   grid on; ylabel('Roll \omega (deg/s)');
-  legend('cmd raw','cmd after act','true \omega','Location','NorthEast'); title('Roll angular velocity');
+  legend('cmd raw','true \omega','Location','NorthEast'); title('Roll angular velocity');
 
   subplot(3,1,2);
   plot(t, cmd_before_deg(:,IDX_Y), '--', 'LineWidth', 1.0); hold on;
-  plot(t, cmd_after_deg(:,IDX_Y), '-', 'LineWidth', 1.0);
-  plot(t, angvel_true_deg(:,IDX_Y), ':', 'LineWidth', 1.0);
+  plot(t, angvel_true_deg(:,IDX_Y), '-', 'LineWidth', 1.0);
   grid on; ylabel('Pitch \omega (deg/s)');
-  legend('cmd raw','cmd after act','true \omega','Location','NorthEast'); title('Pitch angular velocity');
+  legend('cmd raw','true \omega','Location','NorthEast'); title('Pitch angular velocity');
 
   subplot(3,1,3);
   plot(t, cmd_before_deg(:,IDX_Z), '--', 'LineWidth', 1.0); hold on;
-  plot(t, cmd_after_deg(:,IDX_Z), '-', 'LineWidth', 1.0);
-  plot(t, angvel_true_deg(:,IDX_Z), ':', 'LineWidth', 1.0);
+  plot(t, angvel_true_deg(:,IDX_Z), '-', 'LineWidth', 1.0);
   grid on; ylabel('Yaw \omega (deg/s)');
   xlabel('Time (s)');
-  legend('cmd raw','cmd after act','true \omega','Location','NorthEast'); title('Yaw angular velocity');
+  legend('cmd raw','true \omega','Location','NorthEast'); title('Yaw angular velocity');
+
+  figure('Name','Flywheel Torque','NumberTitle','off');
+  torque_desired_deg = rad2deg(state.torque_wheel_desired);
+  torque_actual_deg = rad2deg(state.torque_wheel_actual);
+
+  subplot(3,1,1);
+  plot(state.t, torque_desired_deg(:,params.IDX_X), '--', 'LineWidth', 1.2); hold on;
+  plot(state.t, torque_actual_deg(:,params.IDX_X), '-', 'LineWidth', 1.2);
+  grid on; ylabel('Roll Torque (deg/s²)'); title('Flywheel Torque: Roll');
+  legend('desired','actual','Location','NorthEast');
+
+  subplot(3,1,2);
+  plot(state.t, torque_desired_deg(:,params.IDX_Y), '--', 'LineWidth', 1.2); hold on;
+  plot(state.t, torque_actual_deg(:,params.IDX_Y), '-', 'LineWidth', 1.2);
+  grid on; ylabel('Pitch Torque (deg/s²)'); title('Flywheel Torque: Pitch');
+  legend('desired','actual','Location','NorthEast');
+
+  subplot(3,1,3);
+  plot(state.t, torque_desired_deg(:,params.IDX_Z), '--', 'LineWidth', 1.2); hold on;
+  plot(state.t, torque_actual_deg(:,params.IDX_Z), '-', 'LineWidth', 1.2);
+  grid on; ylabel('Yaw Torque (deg/s²)'); xlabel('Time (s)'); title('Flywheel Torque: Yaw');
+  legend('desired','actual','Location','NorthEast');
 
   drawnow();
 endfunction
