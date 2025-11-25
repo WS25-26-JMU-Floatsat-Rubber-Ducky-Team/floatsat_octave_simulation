@@ -6,7 +6,7 @@ function main()
   state  = setup_state(params);
   [state, params] = run_simulation(state, params);
   plot_results(state, params);
-  plot_3d_floatsat(state);
+  plot_3d_floatsat(state, params);
   pause();
 endfunction
 
@@ -35,9 +35,9 @@ function params = setup_params()
   params.INITIAL_YAW = 0.0;
 
   % PID tuning (per-axis)
-  params.PID.Kp = [0.2, 0.2, 0.2];
+  params.PID.Kp = [0.1, 0.1, 0.1];
   params.PID.Ki = [0.05, 0.05, 0.05];
-  params.PID.Kd = [0.1, 0.1, 0.1];
+  params.PID.Kd = [0.15, 0.15, 0.15];
   params.PID.tau_D = 0.02;
   params.PID.integrator_min_frac = -0.5;  % fraction of actuator max (scaled later)
   params.PID.integrator_max_frac =  0.5;
@@ -54,7 +54,7 @@ function params = setup_params()
 
   % Flywheel actuator parameters
   % per-wheel rotational inertia (kg·m^2). Measure or compute from geometry.
-  params.FLYWHEEL.Jw = [0.01, 0.01, 0.01];
+  params.FLYWHEEL.Jw = [0.005, 0.005, 0.005];
   % maximum wheel spin rate (rad/s)
   params.FLYWHEEL.wheel_angvel_max = [rpm2rads(900), rpm2rads(900), rpm2rads(900)]; % rad/s
   % motor torque limits
@@ -64,19 +64,19 @@ function params = setup_params()
   % Each row is a vector [x,y,z]. These are separate physical quantities.
   params.WHEEL_POS = [ 0.0633, 0.0, 0.0;   % wheel 1 position (m)
                        0.0, 0.0633, 0.0;   % wheel 2 position
-                       0.0, 0.0, 0.0633 ]; % wheel 3 position
+                       0.0, 0.0, -0.0633 ]; % wheel 3 position
   % Wheel spin axes (unit vectors). For tilted wheels set appropriate vectors (unitized).
-  params.WHEEL_AXIS = [ 0.8165, -0.4083, -0.4083;
-                        0, 0.7071, -0.7071;
-                        0.5773, 0.5773, 0.5773 ];
+  % params.WHEEL_AXIS = [ 0.8165, -0.4083, -0.4083;
+  %                       -0.7071, 0.7071, -0.7071;
+  %                       0.5773, 0.5773, -0.5773 ];
 
-  % params.WHEEL_AXIS = [ 1, 0, 0;
-  %                       0, 1, 0;
-  %                       0, 0, 1];
+  params.WHEEL_AXIS = [ 1, 0, 0;
+                        0, 1, 0;
+                        0, 0, 1 ];
 
-  params.I_body = [ 0.05, -0.001, 0.002;
-                    -0.001, 0.06, -0.003;
-                     0.002, -0.003, 0.08 ];  % kg·m^2
+  params.I_body = [ 0.1, 0, 0;
+                    0, 0.1, 0;
+                    0, 0, 0.1 ];  % kg·m^2
   params.I_body_inv = inv(params.I_body);
 
   % Make params easier to pass to comp_step
@@ -127,8 +127,10 @@ function state = setup_state(params)
   % Wheel speeds over time (N×3) and motor torque command history
   state.wheel_angvel = zeros(N,3);         % rad/s, wheel spin rates logged
   state.tau_motor_cmd = zeros(N,3);        % commanded motor torque (N·m)
+  state.wheel_angle  = zeros(N,3);         % rad, integrated wheel rotation (for visualization)
   % initial wheel speed (0)
   state.wheel_angvel(1,:) = [0,0,0];
+  state.wheel_angle(1,:) = [0,0,0];
 
   % Initial true state: level + initial yaw
   state.angle_true(1,:) = [0, 0, params.INITIAL_YAW];
@@ -210,6 +212,7 @@ function [state, params] = run_simulation(state, params)
       state.wheel_angvel(k,i) = wheel_w_prev(i) + wheel_w_dot(i) * DT;
       % enforce wheel speed limits
       state.wheel_angvel(k,i) = clamp(state.wheel_angvel(k,i), -params.FLYWHEEL.wheel_angvel_max(i), params.FLYWHEEL.wheel_angvel_max(i));
+      state.wheel_angle(k,i) = state.wheel_angle(k-1,i) + state.wheel_angvel(k,i) * DT;
     endfor
 
     % Reaction torque on body from wheels (sum of -tau_motor_i * n_i)
@@ -390,7 +393,7 @@ function [roll_f, pitch_f, yaw_f, qf] = comp_step(roll_prev, pitch_prev, yaw_pre
   qf = qf';
 endfunction
 
-function plot_3d_floatsat(state)
+function plot_3d_floatsat(state, params)
     figure('Name','3D FloatSat Visualization','NumberTitle','off');
     axis equal
     grid on
@@ -398,41 +401,150 @@ function plot_3d_floatsat(state)
     view(3)
     hold on
 
-    % Fix axes limits (cube of size 0.2 m + margin)
-    axis_limit = 0.1;
+    % Fixed axes limits
+    axis_limit = 0.2;
     axis([-axis_limit axis_limit -axis_limit axis_limit -axis_limit axis_limit]);
     axis manual;
 
-    % Cube vertices (centered at origin, size 0.1 m)
+    % Cube verts (body frame)
     s = 0.1;
-    [X,Y,Z] = ndgrid([-1,1]*s/2);
-    verts = [X(:), Y(:), Z(:)];
+    [Xc,Yc,Zc] = ndgrid([-1,1]*s/2);
+    verts_cube = [Xc(:), Yc(:), Zc(:)];
+    faces_cube = [1 3 7 5; 2 4 8 6; 1 2 6 5; 3 4 8 7; 1 2 4 3; 5 6 8 7];
 
-    % Cube faces (for patch)
-    faces = [1 3 7 5; 2 4 8 6; 1 2 6 5; 3 4 8 7; 1 2 4 3; 5 6 8 7];
+    % Draw cube + top face handle(s)
+    hCube = patch('Vertices',verts_cube,'Faces',faces_cube,'FaceColor','cyan','FaceAlpha',0.3);
 
-    hCube = patch('Vertices',verts,'Faces',faces,'FaceColor','cyan','FaceAlpha',0.3);
+    % Prepare flywheel meshes in local wheel coords (cylinder pointing along +Z)
+    n_wheels = size(params.WHEEL_POS,1);
+    wheel_mesh = cell(n_wheels,1);
+    wheel_faces = cell(n_wheels,1);
+    wheel_Ralign = cell(n_wheels,1);
+    wheel_pos = cell(n_wheels,1);
+    wheel_handle = zeros(1,n_wheels);
 
-    % Draw a +Z axis arrow (from origin along body up)
-    hArrow = quiver3(0,0,0,0,0,0.15,'LineWidth',2,'Color','magenta','MaxHeadSize',0.5);
+    % choose geometry for wheels
+    wheel_radius = 0.03;
+    wheel_length = 0.025;
 
-    % Animation loop
+    for i = 1:n_wheels
+      [verts_cyl, faces_cyl] = make_cylinder_mesh(wheel_radius, wheel_length, 24);
+      wheel_mesh{i} = verts_cyl; wheel_faces{i} = faces_cyl;
+      ni = params.WHEEL_AXIS(i,:)';
+      % precompute alignment rotation from +Z to ni (in body frame)
+      % if ni is near [0;0;1], set Ralign=eye
+      if norm(ni - [0;0;1]) < 1e-6
+        Ralign = eye(3);
+      else
+        % rotation axis = cross(z, ni)
+        rot_axis = cross([0;0;1], ni);
+        s = norm(rot_axis);
+        c = dot([0;0;1], ni);
+        if s < 1e-9
+          Ralign = eye(3);
+        else
+          Ralign = axis_angle_rot(rot_axis / s, atan2(s, c));
+        end
+      end
+      wheel_Ralign{i} = Ralign;
+      wheel_pos{i} = params.WHEEL_POS(i,:)'; % in body frame
+      % create initial patch (will replace vertices every frame)
+      wheel_handle(i) = patch('Vertices',verts_cyl,'Faces',faces_cyl,'FaceColor',[0.6,0.6,0.6],'FaceAlpha',1.0);
+    endfor
+
     N = length(state.t);
     for k = 1:N
-        q = state.Qf(k,:); % quaternion
-        R = quat2rotm(q);   % 3x3 rotation matrix from body to world frame
+        q = state.Qf(k,:); % quaternion [w x y z]
+        R_body_to_world = quat2rotm(q);   % 3x3 rotation matrix
 
-        % Rotate vertices
-        verts_rot = (R * verts')';
-        set(hCube,'Vertices',verts_rot);
+        % Cube update
+        verts_cube_world = (R_body_to_world * verts_cube')';
+        set(hCube,'Vertices', verts_cube_world);
 
-        % Rotate arrow: points along body +Z
-        arrow_dir = R * [0;0;0.15];
-        set(hArrow,'UData',arrow_dir(1),'VData',arrow_dir(2),'WData',arrow_dir(3));
+        % Wheels: transform and spin
+        for i = 1:n_wheels
+            verts_cyl = wheel_mesh{i}'; % 3 x Nv (in local cyl coords)
+            % rotation about wheel axis by wheel_angle[k,i] (in body frame)
+            angle = state.wheel_angle(k,i);
+            ni = params.WHEEL_AXIS(i,:)';
+            Rspin = axis_angle_rot(ni, angle); % rotate about ni in body frame
+            % align cylinder then spin: produce verts in body frame
+            verts_body = (Rspin * (wheel_Ralign{i} * verts_cyl));
+            % translate to wheel mount pos (body frame)
+            pos_body = wheel_pos{i};
+            verts_body = verts_body + repmat(pos_body, 1, size(verts_body,2));
+            % transform to world frame
+            verts_world = (R_body_to_world * verts_body)';
+            set(wheel_handle(i), 'Vertices', verts_world);
+        endfor
 
-        drawnow
-        pause(0.01); % adjust speed
+        drawnow;
+        pause(0.01);
     endfor
+endfunction
+
+function R = axis_angle_rot(axis, theta)
+  % Rodrigues rotation matrix: rotate around (3x1) axis (unit) by theta radians.
+  if norm(axis) < 1e-12
+    R = eye(3);
+    return;
+  end
+  u = axis / norm(axis);
+  ux = [   0, -u(3),  u(2);
+         u(3),    0, -u(1);
+        -u(2), u(1),    0 ];
+  R = eye(3) * cos(theta) + (1 - cos(theta)) * (u * u') + ux * sin(theta);
+endfunction
+
+function [verts, faces] = make_cylinder_mesh(radius, length, nseg)
+  % Cylinder along local Z from -length/2 .. +length/2
+  if nargin < 3, nseg = 24; end
+  [X,Y] = cylinder(radius, nseg);
+  Z = repmat(linspace(-length/2, length/2, size(X,1))', 1, size(X,2));
+  verts = [X(:), Y(:), Z(:)];
+  % build faces (side quads + two caps)
+  nv_per_ring = size(X,2);
+  faces = [];
+  % side quads
+  for c = 1:(nv_per_ring-1)
+    for r = 1:(size(X,1)-1)
+      a = (r-1)*nv_per_ring + c;
+      b = a + 1;
+      d = a + nv_per_ring;
+      cidx = b + nv_per_ring;
+      faces = [faces; a b cidx d];
+    endfor
+  endfor
+  % seam quads (wrap last->first)
+  for r = 1:(size(X,1)-1)
+    a = (r-1)*nv_per_ring + nv_per_ring;
+    b = (r-1)*nv_per_ring + 1;
+    d = a + nv_per_ring;
+    cidx = b + nv_per_ring;
+    faces = [faces; a b cidx d];
+  endfor
+  % caps (triangulate fan)
+  top_center_idx = size(verts,1) + 1;
+  bottom_center_idx = size(verts,1) + 2;
+  verts = [verts; 0 0 length/2; 0 0 -length/2];
+  for c = 1:(nv_per_ring-1)
+    a = (size(X,1)-1)*nv_per_ring + c;
+    b = a + 1;
+    faces = [faces; a b top_center_idx top_center_idx];
+  endfor
+  % seam for top
+  a = (size(X,1)-1)*nv_per_ring + nv_per_ring;
+  b = (size(X,1)-1)*nv_per_ring + 1;
+  faces = [faces; a b top_center_idx top_center_idx];
+  % bottom cap (reverse order)
+  for c = 1:(nv_per_ring-1)
+    a = c;
+    b = c + 1;
+    faces = [faces; b a bottom_center_idx bottom_center_idx];
+  endfor
+  a = nv_per_ring;
+  b = 1;
+  faces = [faces; b a bottom_center_idx bottom_center_idx];
 endfunction
 
 function R = quat2rotm(q)
