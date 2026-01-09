@@ -28,13 +28,6 @@ function params = setup_params()
   % Axis indices
   params.IDX_X = 1; params.IDX_Y = 2; params.IDX_Z = 3;
 
-  % Complementary filter tuning (time constant -> alpha)
-  params.TAU = 0.5;
-  params.ALPHA = params.TAU / (params.TAU + params.DT);
-
-  params.TAU_YAW = 5.0;               % seconds (tune)
-  params.ALPHA_YAW = params.TAU_YAW / (params.TAU_YAW + params.DT);
-
   % Initial yaw
   params.INITIAL_YAW = 0.0;
 
@@ -102,7 +95,6 @@ function params = setup_params()
 
   % Make params easier to pass to comp_step
   params.comp.DT = params.DT;
-  params.comp.ALPHA = params.ALPHA;
   params.comp.EPS = params.EPS;
   params.comp.IDX_X = params.IDX_X;
   params.comp.IDX_Y = params.IDX_Y;
@@ -125,6 +117,14 @@ function params = setup_params()
   params.SENSOR.MAG_QUANT = 0.0;   % rad/s
   params.SENSOR.GYRO_QUANT = 0.0;   % rad/s
   params.SENSOR.ACC_QUANT  = 0.0;   % m/s^2
+
+  % Complementary filter tuning
+  params.TAU = 0.5;
+  params.TAU_YAW = 5.0;
+
+  params.FILTER.WEIGHT_ACC = params.DT / params.TAU;     % roll/pitch correction
+  params.FILTER.WEIGHT_MAG = params.DT / params.TAU_YAW; % yaw correction
+
 endfunction
 
 function state = setup_state(params)
@@ -296,7 +296,7 @@ function [state, params] = run_simulation(state, params)
     % (optional) store true sensors too for logging
     state.gyr_true(k,:) = gyr_true_prev;
     state.acc_true(k,:) = acc_true_prev;
-    qf = comp_step_quat(q_prev_f, state.gyr_meas(k,:), state.acc_meas(k,:), params.comp, mag_meas);
+    qf = comp_step_quat(q_prev_f, state.gyr_meas(k,:), state.acc_meas(k,:), state.mag_meas(k,:), params);
     state.Qf(k,:) = qf';
 
     eul_filt = quat2eul(qf');  % [roll pitch yaw]
@@ -504,12 +504,12 @@ function acc_body = true_accel_from_quat(q, G)
   acc_body = acc_body_vec(:)'; % return as 1x3 row vector
 endfunction
 
-function qf = comp_step_quat(q_prev, gyr, acc, params, mag)
-  % Complementary filter fully in quaternion using accel + mag
-  DT = params.DT; ALPHA = params.ALPHA; EPS = params.EPS;
+function qf = comp_step_quat(q_prev, gyr, acc, mag, params)
+  DT = params.DT;
+  EPS = params.EPS;
 
-  % --- Propagate quaternion using gyro ---
-  wx = gyr(params.IDX_X); wy = gyr(params.IDX_Y); wz = gyr(params.IDX_Z);
+  % Gyro propagation
+  wx = gyr(1); wy = gyr(2); wz = gyr(3);
   Omega = 0.5 * [  0, -wx, -wy, -wz;
                    wx,   0,  wz, -wy;
                    wy, -wz,   0,  wx;
@@ -518,11 +518,38 @@ function qf = comp_step_quat(q_prev, gyr, acc, params, mag)
   q_gyro = q_prev + q_dot * DT;
   q_gyro = q_gyro / (norm(q_gyro) + 1e-12);
 
-  % --- Accel + magnetometer quaternion (full attitude) ---
-  q_accmag = quat_from_accmag(acc, mag, EPS);
+  % Extract gyro Euler angles
+  eul_gyro = quat2eul(q_gyro');  % [roll pitch yaw]
 
-  % --- Complementary filter: SLERP between gyro and accel+mag ---
-  qf = slerp(q_gyro, q_accmag, 1 - ALPHA);
+  roll_g  = eul_gyro(1);
+  pitch_g = eul_gyro(2);
+  yaw_g   = eul_gyro(3);
+
+  % Roll/pitch from accelerometer
+  ax = acc(1); ay = acc(2); az = acc(3);
+  roll_acc  = atan2(ay, az);
+  pitch_acc = atan2(-ax, sqrt(ay^2 + az^2 + EPS));
+
+  % Yaw from magnetometer (tilt compensated)
+  sin_r = sin(roll_g);  cos_r = cos(roll_g);
+  sin_p = sin(pitch_g); cos_p = cos(pitch_g);
+
+  mx = mag(1); my = mag(2); mz = mag(3);
+  mx2 = mx * cos_p + my * sin_r * sin_p + mz * cos_r * sin_p;
+  my2 = my * cos_r - mz * sin_r;
+
+  yaw_mag = atan2(-my2, mx2);
+
+  % Weighted complementary correction
+  roll_f  = (1 - params.FILTER.WEIGHT_ACC) * roll_g  + params.FILTER.WEIGHT_ACC * roll_acc;
+  pitch_f = (1 - params.FILTER.WEIGHT_ACC) * pitch_g + params.FILTER.WEIGHT_ACC * pitch_acc;
+
+  % wrap-safe yaw blending
+  yaw_err = atan2(sin(yaw_mag - yaw_g), cos(yaw_mag - yaw_g));
+  yaw_f   = yaw_g + params.FILTER.WEIGHT_MAG * yaw_err;
+
+  % --- 6. Back to quaternion ---
+  qf = eul2quat(roll_f, pitch_f, yaw_f)';
   qf = qf / (norm(qf) + 1e-12);
 endfunction
 
