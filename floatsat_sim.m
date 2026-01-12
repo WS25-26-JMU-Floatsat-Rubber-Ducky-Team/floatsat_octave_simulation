@@ -31,13 +31,19 @@ function params = setup_params()
   % Initial yaw
   params.INITIAL_YAW = 0.0;
 
-  % PID tuning (per-axis)
-  params.PID.Kp = [1.5, 1.5, 1.5];
-  params.PID.Ki = [3, 3, 3];
-  params.PID.Kd = [5, 5, 5];
-  params.PID.tau_D = 0.02;
-  params.PID.integrator_min_frac = -0.5;  % fraction of actuator max (scaled later)
-  params.PID.integrator_max_frac =  0.5;
+  % Angle/Position PID tuning (per-axis)
+  params.PID.ANGLE.Kp = [1, 1, 1];
+  params.PID.ANGLE.Ki = [0, 0, 0];
+  params.PID.ANGLE.Kd = [0, 0, 0];
+  params.PID.ANGLE.tau_D = 0.02;
+  params.PID.ANGLE.integrator_min_frac = -0.5;  % fraction of actuator max (scaled later)
+  params.PID.ANGLE.integrator_max_frac =  0.5;
+
+  % Inner-Loop Rate/Velocity PID tuning (per-axis)
+  params.PID.RATE.Kp = [1, 1, 1];
+  params.PID.RATE.Ki = [0.5, 0.5, 0.5];
+  params.PID.RATE.Kd = [0, 0, 0];
+  params.CTRL.MAX_ANGVEL_CMD = deg2rad([10, 10, 10]);
 
   % Actuator (placeholder: currently maps commanded angvel -> true angvel)
   params.ACTUATOR_MAX_ANGVEL_DEG = 60;
@@ -159,9 +165,13 @@ function state = setup_state(params)
   state.cmd_after_act = zeros(N,3);
 
   % PID state
-  state.pid.integrator = [0,0,0];
-  state.pid.prev_error = [0,0,0];
-  state.pid.prev_derivative = [0,0,0];
+  state.pid.angle.integrator = [0,0,0];
+  state.pid.angle.prev_error = [0,0,0];
+  state.pid.angle.prev_derivative = [0,0,0];
+
+  state.pid.rate.integrator = [0,0,0];
+  state.pid.rate.prev_error = [0,0,0];
+  state.pid.rate.prev_derivative = [0,0,0];
 
   % Wheel torque applied at each step
   state.torque_wheel_actual = zeros(N,3);   % torque actually applied by wheel
@@ -213,8 +223,8 @@ function state = setup_state(params)
   state.acc_meas(1,:) = true_accel_from_quat(state.Q_true, params.G);
 
   % Scale integrator limits based on actuator
-  state.PID_integrator_min = params.PID.integrator_min_frac * 1;
-  state.PID_integrator_max = params.PID.integrator_max_frac * 1;
+  state.PID_integrator_min = params.PID.ANGLE.integrator_min_frac * 1;
+  state.PID_integrator_max = params.PID.ANGLE.integrator_max_frac * 1;
 endfunction
 
 % -------------------------------------------------------------------------
@@ -307,8 +317,25 @@ function [state, params] = run_simulation(state, params)
     % --- Step 2: Compute quaternion setpoint from setpoint Euler angles ---
     q_setpoint = eul2quat(state.setpoint(k,1), state.setpoint(k,2), state.setpoint(k,3))';
 
-    % --- Step 3: PID in quaternion error space ---
-    [tau_desired_body, state.pid] = pid_quat(qf, q_setpoint, state.pid, params, params.DT);
+    % --- Step 3a: Angle controller (attitude → rate command) ---
+    [omega_cmd, state.pid.angle] = angle_controller( ...
+        qf, ...
+        q_setpoint, ...
+        state.pid.angle, ...
+        params, ...
+        DT ...
+    );
+    state.cmd_angvel(k,:) = omega_cmd';
+
+    % --- Step 3b: Rate controller (rate → body torque) ---
+    omega_meas = state.gyr_meas(k,:)';  % gyro ≈ body rate
+    [tau_desired_body, state.pid.rate] = rate_controller( ...
+        omega_cmd, ...
+        omega_meas, ...
+        state.pid.rate, ...
+        params, ...
+        DT ...
+    );
 
     % --- Step 4: Torque allocation to wheels ---
     Nmat = params.WHEEL_AXIS'; % 3x3 where column i = wheel axis vector
@@ -606,34 +633,60 @@ function R = axis_angle_rot(axis, theta)
   R = eye(3) * cos(theta) + (1 - cos(theta)) * (u * u') + ux * sin(theta);
 endfunction
 
-function [tau_desired_body, pid_state] = pid_quat(q_current, q_setpoint, pid_state, params, DT)
-  % Compute body torque using quaternion error
-  % q_current, q_setpoint: 4x1 quaternions
-  % pid_state: struct with .integrator, .prev_error (3x1)
-  % Returns 3x1 torque vector
-
-  % --- Quaternion error (rotation from current -> setpoint) ---
+function [omega_cmd, angle_state] = angle_controller(q_current, q_setpoint, angle_state, params, DT)
+  % Quaternion error
   q_err = quatmultiply(quatconjugate(q_current'), q_setpoint'); % 1x4
   if q_err(1) < 0
-      q_err = -q_err;  % shortest rotation
+      q_err = -q_err;
   end
-  % rotation vector approximation: small angle
-  rot_err = q_err(2:4) * 2;  % 3x1 vector
 
-  tau_desired_body = zeros(3,1);
+  % Small-angle rotation vector
+  rot_err = 2 * q_err(2:4);  % 3x1
+
+  omega_cmd = zeros(3,1);
   for axis = 1:3
       err = rot_err(axis);
-      % PID
-      pid_state.integrator(axis) = pid_state.integrator(axis) + err * DT * params.PID.Ki(axis);
-      pid_state.integrator(axis) = clamp(pid_state.integrator(axis), ...
-                                         params.PID.integrator_min_frac, ...
-                                         params.PID.integrator_max_frac);
-      derivative_raw = (err - pid_state.prev_error(axis)) / DT;
-      tau = params.PID.tau_D;
-      D_filtered = (tau * pid_state.prev_derivative(axis) + DT * derivative_raw) / (tau + DT);
-      pid_state.prev_derivative(axis) = D_filtered;
-      pid_state.prev_error(axis) = err;
-      tau_desired_body(axis) = params.PID.Kp(axis)*err + pid_state.integrator(axis) + params.PID.Kd(axis)*D_filtered;
+
+      % Integrator (optional; you can keep Ki=0 initially)
+      angle_state.integrator(axis) += err * DT * params.PID.ANGLE.Ki(axis);
+      angle_state.integrator(axis) = clamp( ...
+          angle_state.integrator(axis), ...
+          params.PID.ANGLE.integrator_min_frac, ...
+          params.PID.ANGLE.integrator_max_frac ...
+      );
+
+      omega_cmd(axis) = ...
+          params.PID.ANGLE.Kp(axis) * err + ...
+          angle_state.integrator(axis);
+  end
+
+  % Safety clamp (physical max angvel for motors)
+  omega_cmd = clamp(omega_cmd, ...
+                    -params.ACTUATOR_MAX_ANGVEL, ...
+                     params.ACTUATOR_MAX_ANGVEL);
+
+  % Speed control clamping
+  omega_cmd = min(omega_cmd,  params.CTRL.MAX_ANGVEL_CMD(:));
+  omega_cmd = max(omega_cmd, -params.CTRL.MAX_ANGVEL_CMD(:));
+endfunction
+
+function [tau_body, rate_state] = rate_controller(omega_cmd, omega_meas, rate_state, params, DT)
+  tau_body = zeros(3,1);
+
+  for axis = 1:3
+      err = omega_cmd(axis) - omega_meas(axis);
+
+      % Integrator
+      rate_state.integrator(axis) += err * DT * params.PID.RATE.Ki(axis);
+
+      % Derivative
+      d_raw = (err - rate_state.prev_error(axis)) / DT;
+      rate_state.prev_error(axis) = err;
+
+      tau_body(axis) = ...
+          params.PID.RATE.Kp(axis) * err + ...
+          rate_state.integrator(axis) + ...
+          params.PID.RATE.Kd(axis) * d_raw;
   end
 endfunction
 
